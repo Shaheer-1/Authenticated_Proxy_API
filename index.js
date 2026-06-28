@@ -1,65 +1,76 @@
 const express = require('express');
-const app = express();
+// const { PrismaClient } = require('@prisma/client');
+const { PrismaClient } = require('./node_modules/@prisma/client');
 
-// This line lets you read JSON from request bodies (req.body)
-// Without it, req.body is always undefined — a common beginner mistake
+const app = express();
+const prisma = new PrismaClient();
+
 app.use(express.json());
 
-// In-memory store — Hour 2 will replace this with PostgreSQL
-let tasks = [];
-let nextId = 1;
-
-// GET /tasks — return all tasks
-app.get('/tasks', (req, res) => {
-  res.json(tasks);
+// GET /tasks
+app.get('/tasks', async (req, res) => {
+  try {
+    const tasks = await prisma.task.findMany({
+      orderBy: { createdAt: 'desc' }
+    });
+    res.json(tasks);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch tasks' });
+  }
 });
 
-// POST /tasks — create a new task
-app.post('/tasks', (req, res) => {
-  const { title } = req.body;
+// POST /tasks
+app.post('/tasks', async (req, res) => {
+  try {
+    const { title } = req.body;
 
-  if (!title) {
-    return res.status(400).json({ error: 'Title is required' });
+    if (!title) {
+      return res.status(400).json({ error: 'Title is required' });
+    }
+
+    const task = await prisma.task.create({
+      data: { title }
+    });
+
+    res.status(201).json(task);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create task' });
   }
-
-  const task = {
-    id: nextId++,
-    title,
-    status: 'pending',
-    createdAt: new Date().toISOString()
-  };
-
-  tasks.push(task);
-  res.status(201).json(task);
 });
 
-// PUT /tasks/:id — update a task's title or status
-app.put('/tasks/:id', (req, res) => {
-  const id = parseInt(req.params.id);
-  const task = tasks.find(t => t.id === id);
+// PUT /tasks/:id
+app.put('/tasks/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { title, status } = req.body;
 
-  if (!task) {
-    return res.status(404).json({ error: 'Task not found' });
+    const task = await prisma.task.update({
+      where: { id },
+      data: {
+        ...(title && { title }),
+        ...(status && { status })
+      }
+    });
+
+    res.json(task);
+  } catch (error) {
+    res.status(500).json({ error: 'Task not found or update failed' });
   }
-
-  const { title, status } = req.body;
-  if (title) task.title = title;
-  if (status) task.status = status;
-
-  res.json(task);
 });
 
-// DELETE /tasks/:id — remove a task
-app.delete('/tasks/:id', (req, res) => {
-  const id = parseInt(req.params.id);
-  const index = tasks.findIndex(t => t.id === id);
+// DELETE /tasks/:id
+app.delete('/tasks/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
 
-  if (index === -1) {
-    return res.status(404).json({ error: 'Task not found' });
+    await prisma.task.delete({
+      where: { id }
+    });
+
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ error: 'Task not found or delete failed' });
   }
-
-  tasks.splice(index, 1);
-  res.status(204).send();
 });
 
 const PORT = 3000;
