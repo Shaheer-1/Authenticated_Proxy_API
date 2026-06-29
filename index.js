@@ -1,5 +1,8 @@
-// const { PrismaClient } = require('./node_modules/@prisma/client');
-require('dotenv').config(); // must be the very first line
+require('dotenv').config();
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET is not set in .env');
+  process.exit(1);
+}
 
 const express = require('express');
 const { PrismaClient } = require('@prisma/client');
@@ -157,6 +160,14 @@ app.delete('/tasks/:id', authenticate, async (req, res) => {
   }
 });
 
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// 404 — the last option, after every other route
+app.use((req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
 const PORT = 3000;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
