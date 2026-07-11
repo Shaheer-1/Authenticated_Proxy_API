@@ -320,6 +320,47 @@ Delete a task. Only the task owner can delete it.
 
 ---
 
+### Proxy Routes (Protected)
+
+> All routes below require the header: `Authorization: Bearer <token>`
+
+These endpoints forward to third-party APIs using **server-side keys**, so the upstream credentials never reach the browser — the client only ever sees your domain and its JWT. Endpoints are scoped to a fixed upstream (never a generic open proxy, which would be an SSRF risk).
+
+#### `GET /api/weather`
+
+Fetch current weather for a city. Requires a `city` query parameter and `OPENWEATHER_API_KEY` in `.env`.
+
+**Request:**
+```
+GET /api/weather?city=London
+Authorization: Bearer <token>
+```
+
+**Response — 200 OK:**
+```json
+{
+  "city": "London",
+  "country": "GB",
+  "temperature": 12.5,
+  "feelsLike": 10.1,
+  "condition": "scattered clouds",
+  "humidity": 81,
+  "windSpeed": 3.6
+}
+```
+
+**Error Responses:**
+| Status | Cause                              |
+|--------|------------------------------------|
+| 400    | Missing or invalid `city`          |
+| 401    | No token provided                  |
+| 403    | Invalid/expired token              |
+| 404    | City not found                     |
+| 502    | Upstream service error             |
+| 503    | `OPENWEATHER_API_KEY` not set      |
+
+---
+
 ## Authentication Flow
 
 ```

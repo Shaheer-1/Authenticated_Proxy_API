@@ -160,6 +160,59 @@ app.delete('/tasks/:id', authenticate, async (req, res) => {
   }
 });
 
+// ── PROXY ROUTES (protected — token required) ──────────────────────────────
+// Forward to third-party APIs using server-side keys so the browser never sees
+// the upstream credentials. Scoped endpoints only: never a generic open proxy
+// (that would be an SSRF risk — attackers could pivot to internal services).
+
+app.get('/api/weather', authenticate, async (req, res) => {
+  const city = req.query.city;
+
+  if (typeof city !== 'string' || !city.trim()) {
+    return res.status(400).json({ error: 'city query parameter is required' });
+  }
+
+  // Allow only safe characters in the city name (letters, numbers, spaces, .,'-).
+  if (!/^[\p{L}\p{N} ,.'-]+$/u.test(city.trim())) {
+    return res.status(400).json({ error: 'Invalid city name' });
+  }
+
+  const apiKey = process.env.OPENWEATHER_API_KEY;
+  if (!apiKey) {
+    return res.status(503).json({ error: 'Weather service not configured' });
+  }
+
+  const url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city.trim())}&units=metric&appid=${apiKey}`;
+
+  try {
+    const upstream = await fetch(url);
+
+    // Don't surface upstream auth errors — the key is server-side.
+    if (upstream.status === 401 || upstream.status === 403) {
+      return res.status(502).json({ error: 'Upstream service unavailable' });
+    }
+    if (upstream.status === 404) {
+      return res.status(404).json({ error: 'City not found' });
+    }
+    if (!upstream.ok) {
+      return res.status(502).json({ error: 'Upstream request failed' });
+    }
+
+    const data = await upstream.json();
+    res.json({
+      city: data.name,
+      country: data.sys?.country,
+      temperature: data.main?.temp,
+      feelsLike: data.main?.feels_like,
+      condition: data.weather?.[0]?.description,
+      humidity: data.main?.humidity,
+      windSpeed: data.wind?.speed
+    });
+  } catch (error) {
+    res.status(502).json({ error: 'Failed to reach upstream service' });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
