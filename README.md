@@ -119,10 +119,14 @@ Authenticated_Proxy_API/
 
 ## Configuration
 
-| Variable       | Description                                                  | Required |
-|----------------|--------------------------------------------------------------|----------|
-| `DATABASE_URL` | PostgreSQL connection string (used by Prisma Client)         | Yes      |
-| `JWT_SECRET`   | Secret key used to sign and verify JWT access tokens         | Yes      |
+| Variable             | Description                                                  | Required |
+|----------------------|--------------------------------------------------------------|----------|
+| `DATABASE_URL`       | PostgreSQL connection string (used by Prisma Client)         | Yes      |
+| `JWT_SECRET`         | Secret key used to sign and verify JWT access tokens         | Yes      |
+| `OPENWEATHER_API_KEY`| Server-side OpenWeatherMap key for the `/api/weather` proxy  | Yes*     |
+| `CORS_ORIGIN`        | Comma-separated allowed browser origins (omit in dev)        | No       |
+
+\* Required only if you use the `/api/weather` proxy route.
 
 ---
 
@@ -216,6 +220,27 @@ Log in with existing credentials and receive a JWT token.
 
 ---
 
+#### `POST /auth/logout`
+
+Revoke the caller's current token. JWTs are stateless, so "logout" records the token's `jti` in an in-memory denylist; the token is then rejected on every subsequent request until it expires (7 days).
+
+> **Note:** the denylist is process-local. Revoked tokens survive a server restart (until they expire naturally) and are **not** shared across multiple instances. For horizontal scaling, back the denylist with Redis or a shared store.
+
+**Headers:** `Authorization: Bearer <token>`
+
+**Response — 200 OK:**
+```json
+{ "message": "Logged out" }
+```
+
+**Error Responses:**
+| Status | Cause                              |
+|--------|------------------------------------|
+| 401    | No token / token revoked           |
+| 403    | Invalid or expired token           |
+
+---
+
 ### Task Routes (Protected)
 
 > All routes below require the header: `Authorization: Bearer <token>`
@@ -273,7 +298,7 @@ Create a new task for the authenticated user.
 
 #### `PUT /tasks/:id`
 
-Update a task's title and/or status. Only the task owner can update it.
+Update a task's title and/or status. Only the task owner can update it. `status` must be one of `pending`, `in_progress`, `completed`; `title` is required when provided and capped at 200 characters.
 
 **Request Body** (both fields optional):
 ```json
@@ -297,6 +322,7 @@ Update a task's title and/or status. Only the task owner can update it.
 **Error Responses:**
 | Status | Cause                              |
 |--------|------------------------------------|
+| 400    | Missing/invalid title or status    |
 | 401    | No token provided                  |
 | 403    | Invalid/expired token OR not owner |
 | 404    | Task not found                     |
@@ -397,3 +423,17 @@ npm run dev        # development — runs nodemon with auto-reload
 ```
 
 The server listens on **port 3000** by default.
+
+---
+
+## Running the Tests
+
+Tests use Node's built-in runner (`node:test`) with `supertest` for HTTP and `mock-require` to stub Prisma and `fetch` — **no database or real API key required**.
+
+```bash
+npm test
+```
+
+- `test/revocation.test.js` — the token denylist (revoke / isRevoked / prune)
+- `test/validate.test.js` — input validators (city, title, status)
+- `test/app.test.js` — HTTP routes incl. the logout → reuse-401 revocation flow

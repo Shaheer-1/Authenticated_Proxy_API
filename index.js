@@ -1,23 +1,60 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 if (!process.env.JWT_SECRET) {
   console.error('FATAL: JWT_SECRET is not set in .env');
   process.exit(1);
 }
 
 const express = require('express');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const authenticate = require('./auth');
+const { revoke, startCleanup } = require('./revocation');
+const { TASK_STATUSES, MAX_TITLE, isValidCity, normalizeTitle, isValidStatus } = require('./validate');
 
 const app = express();
 const prisma = new PrismaClient();
 
 app.use(express.json());
 
+// ── CORS ────────────────────────────────────────────────────────────────────
+// Restrict to known origins in production via CORS_ORIGIN (comma-separated).
+// Unset = allow all (dev only). Bearer tokens are used (not cookies), so
+// credentials stay false.
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(',').map(o => o.trim()).filter(Boolean)
+  : null;
+
+if (!allowedOrigins) {
+  console.warn('CORS: CORS_ORIGIN not set — allowing all origins (dev mode). Set CORS_ORIGIN in production.');
+}
+app.use(cors({ origin: allowedOrigins || true, credentials: false }));
+
+// ── RATE LIMITING ────────────────────────────────────────────────────────────
+// authLimiter guards credential endpoints against brute-force / stuffing.
+// apiLimiter protects the third-party (OpenWeatherMap) quota per client IP.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many authentication attempts, please try again later' }
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please slow down' }
+});
+
 // ── AUTH ROUTES (public — no token needed) ──────────────────────────────────
 
-app.post('/auth/register', async (req, res) => {
+app.post('/auth/register', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -32,7 +69,7 @@ app.post('/auth/register', async (req, res) => {
     });
 
     const token = jwt.sign(
-      { userId: user.id, email: user.email },
+      { userId: user.id, email: user.email, jti: crypto.randomUUID() },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -46,7 +83,7 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -64,7 +101,7 @@ app.post('/auth/login', async (req, res) => {
     }
 
     const token = jwt.sign(
-      { userId: user.id, email: user.email },
+      { userId: user.id, email: user.email, jti: crypto.randomUUID() },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -73,6 +110,16 @@ app.post('/auth/login', async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: 'Login failed' });
   }
+});
+
+// ── SESSION ROUTES (authenticated) ───────────────────────────────────────────
+
+// Revoke the caller's current token. JWTs are stateless, so we track revoked
+// IDs in an in-memory denylist (see revocation.js). This is how a leaked
+// 7-day token gets invalidated before it expires.
+app.post('/auth/logout', authenticate, (req, res) => {
+  revoke(req.user.jti, req.user.exp);
+  res.json({ message: 'Logged out' });
 });
 
 // ── TASK ROUTES (protected — token required) ─────────────────────────────────
@@ -92,9 +139,13 @@ app.get('/tasks', authenticate, async (req, res) => {
 app.post('/tasks', authenticate, async (req, res) => {
   try {
     const { title } = req.body;
+    const normalized = normalizeTitle(title);
 
-    if (!title) {
+    if (!normalized) {
       return res.status(400).json({ error: 'Title is required' });
+    }
+    if (normalized.length > MAX_TITLE) {
+      return res.status(400).json({ error: `Title must be ${MAX_TITLE} characters or fewer` });
     }
 
     const task = await prisma.task.create({
@@ -114,6 +165,7 @@ app.put('/tasks/:id', authenticate, async (req, res) => {
   try {
     const id = parseInt(req.params.id);
     const { title, status } = req.body;
+    const updates = {};
 
     const task = await prisma.task.findUnique({ where: { id } });
 
@@ -125,12 +177,27 @@ app.put('/tasks/:id', authenticate, async (req, res) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
+    if (title !== undefined) {
+      const trimmed = normalizeTitle(title);
+      if (!trimmed) {
+        return res.status(400).json({ error: 'Title cannot be empty' });
+      }
+      if (trimmed.length > MAX_TITLE) {
+        return res.status(400).json({ error: `Title must be ${MAX_TITLE} characters or fewer` });
+      }
+      updates.title = trimmed;
+    }
+
+    if (status !== undefined) {
+      if (!isValidStatus(status)) {
+        return res.status(400).json({ error: `Status must be one of: ${TASK_STATUSES.join(', ')}` });
+      }
+      updates.status = status;
+    }
+
     const updated = await prisma.task.update({
       where: { id },
-      data: {
-        ...(title && { title }),
-        ...(status && { status })
-      }
+      data: updates
     });
 
     res.json(updated);
@@ -165,15 +232,10 @@ app.delete('/tasks/:id', authenticate, async (req, res) => {
 // the upstream credentials. Scoped endpoints only: never a generic open proxy
 // (that would be an SSRF risk — attackers could pivot to internal services).
 
-app.get('/api/weather', authenticate, async (req, res) => {
+app.get('/api/weather', authenticate, apiLimiter, async (req, res) => {
   const city = req.query.city;
 
-  if (typeof city !== 'string' || !city.trim()) {
-    return res.status(400).json({ error: 'city query parameter is required' });
-  }
-
-  // Allow only safe characters in the city name (letters, numbers, spaces, .,'-).
-  if (!/^[\p{L}\p{N} ,.'-]+$/u.test(city.trim())) {
+  if (!isValidCity(city)) {
     return res.status(400).json({ error: 'Invalid city name' });
   }
 
@@ -221,7 +283,24 @@ app.get('/health', (req, res) => {
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found' });
 });
-const PORT = 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+
+// Global error handler — Express identifies it by its 4-argument signature.
+// Catches sync throws and unhandled async rejections not handled per-route
+// (e.g. malformed JSON bodies), returning a safe generic 500.
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ error: 'Internal server error' });
 });
+
+const PORT = 3000;
+
+// Only bind a port when run directly (`node index.js`). When imported by the
+// test suite, the app is handed to supertest without listening.
+if (require.main === module) {
+  startCleanup();
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+module.exports = app;
